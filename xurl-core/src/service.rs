@@ -961,7 +961,7 @@ fn collect_thread_metadata(provider: ProviderKind, path: &Path) -> (Vec<String>,
         ProviderKind::Claude => collect_claude_thread_metadata(path, &raw),
         ProviderKind::Cursor => collect_cursor_thread_metadata(path, &raw),
         ProviderKind::Gemini => collect_gemini_thread_metadata(path, &raw),
-        ProviderKind::Kimi => (Vec::new(), Vec::new()),
+        ProviderKind::Kimi => collect_kimi_thread_metadata(path, &raw),
         ProviderKind::Pi => collect_pi_thread_metadata(path, &raw),
         ProviderKind::Opencode => collect_opencode_thread_metadata(path, &raw),
     }
@@ -1166,6 +1166,17 @@ fn collect_pi_thread_metadata(path: &Path, raw: &str) -> (Vec<String>, Vec<Strin
     }
 
     (metadata, warnings)
+}
+
+fn collect_kimi_thread_metadata(path: &Path, _raw: &str) -> (Vec<String>, Vec<String>) {
+    let Some(value) = KimiProvider::metadata_from_context_path(path) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut metadata = Vec::new();
+    let mut seen = BTreeSet::new();
+    let _ = push_thread_metadata_record(&mut metadata, &mut seen, &value);
+    (metadata, Vec::new())
 }
 
 fn collect_amp_thread_metadata(path: &Path, raw: &str) -> (Vec<String>, Vec<String>) {
@@ -5027,6 +5038,8 @@ fn collect_kimi_query_candidates(
         return Vec::new();
     }
 
+    let provider = KimiProvider::new(&roots.kimi_root);
+    let scope_paths_by_hash = provider.scope_paths_by_hash();
     let mut candidates = Vec::new();
     for entry in WalkDir::new(&sessions_root)
         .min_depth(2)
@@ -5046,12 +5059,18 @@ fn collect_kimi_query_candidates(
             continue;
         }
         let session_id = dir_name.to_ascii_lowercase();
+        let scope_path = entry
+            .path()
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .and_then(|hash| scope_paths_by_hash.get(hash).cloned());
         candidates.push(make_file_candidate(
             ProviderKind::Kimi,
             session_id.clone(),
             format!("agents://kimi/{session_id}"),
             context_path,
-            None,
+            scope_path,
         ));
     }
 
@@ -5578,18 +5597,26 @@ fn render_subagent_detail_markdown(view: &SubagentDetailView) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
+    use md5::{Digest, Md5};
     use tempfile::tempdir;
 
     use crate::service::{
-        collect_claude_thread_metadata, collect_codex_thread_metadata, collect_pi_thread_metadata,
-        extract_last_timestamp, read_thread_raw,
+        collect_claude_thread_metadata, collect_codex_thread_metadata,
+        collect_kimi_thread_metadata, collect_pi_thread_metadata, extract_last_timestamp,
+        query_threads_by_path, read_thread_raw,
     };
     use crate::{
-        ProviderKind, ThreadQuery, ThreadQueryItem, ThreadQueryResult,
-        render_thread_query_head_markdown,
+        PathThreadQuery, ProviderKind, ProviderRoots, ThreadQuery, ThreadQueryItem,
+        ThreadQueryResult, render_thread_query_head_markdown,
     };
+
+    fn md5_hex(text: impl AsRef<[u8]>) -> String {
+        let mut hasher = Md5::new();
+        hasher.update(text.as_ref());
+        format!("{:x}", hasher.finalize())
+    }
 
     #[test]
     fn empty_file_returns_error() {
@@ -5676,6 +5703,91 @@ mod tests {
             !metadata
                 .iter()
                 .any(|item| item.contains("thinking_level_change"))
+        );
+    }
+
+    #[test]
+    fn kimi_thread_metadata_reads_workdir_from_kimi_index() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join(".kimi");
+        let work_dir_path = "/tmp/project";
+        let hash = md5_hex(work_dir_path);
+        let session_id = "2823d1df-720a-4c31-ac55-ae8ba726721f";
+        let session_dir = root.join("sessions").join(&hash).join(session_id);
+        fs::create_dir_all(&session_dir).expect("mkdir");
+        let context_path = session_dir.join("context.jsonl");
+        fs::write(&context_path, "{\"role\":\"user\",\"content\":\"hello\"}\n").expect("write");
+        fs::write(
+            root.join("kimi.json"),
+            format!(
+                r#"{{"work_dirs":[{{"path":"{}","kaos":"local","last_session_id":"{}"}}]}}"#,
+                work_dir_path, session_id
+            ),
+        )
+        .expect("write kimi.json");
+
+        let (metadata, warnings) = collect_kimi_thread_metadata(&context_path, "");
+        assert!(warnings.is_empty());
+        assert!(metadata.iter().any(|item| item == "cwd = /tmp/project"));
+        assert!(metadata.iter().any(|item| item == "kaos = local"));
+    }
+
+    #[test]
+    fn path_query_matches_kimi_threads_by_workdir() {
+        let temp = tempdir().expect("tempdir");
+        let kimi_root = temp.path().join(".kimi");
+        let work_dir_path = temp.path().join("workspace").join("repo");
+        let work_dir_text = work_dir_path.display().to_string();
+        let hash = md5_hex(&work_dir_text);
+        let session_id = "2823d1df-720a-4c31-ac55-ae8ba726721f";
+        let session_dir = kimi_root.join("sessions").join(&hash).join(session_id);
+        fs::create_dir_all(&session_dir).expect("mkdir");
+        fs::create_dir_all(&work_dir_path).expect("mkdir workspace");
+        fs::write(
+            session_dir.join("context.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hello from repo\"}\n",
+        )
+        .expect("write");
+        fs::write(
+            kimi_root.join("kimi.json"),
+            format!(
+                r#"{{"work_dirs":[{{"path":"{}","kaos":"local","last_session_id":"{}"}}]}}"#,
+                work_dir_text, session_id
+            ),
+        )
+        .expect("write kimi.json");
+
+        let roots = ProviderRoots {
+            amp_root: PathBuf::from("/nonexistent/amp"),
+            copilot_root: PathBuf::from("/nonexistent/copilot"),
+            codex_root: PathBuf::from("/nonexistent/codex"),
+            claude_root: PathBuf::from("/nonexistent/claude"),
+            cursor_root: PathBuf::from("/nonexistent/cursor"),
+            gemini_root: PathBuf::from("/nonexistent/gemini"),
+            kimi_root,
+            pi_root: PathBuf::from("/nonexistent/pi"),
+            opencode_root: PathBuf::from("/nonexistent/opencode"),
+        };
+        let query = PathThreadQuery {
+            uri: format!("agents:///{work_dir_text}?providers=kimi&limit=5"),
+            scope_path: work_dir_text.clone(),
+            providers: Some(vec![ProviderKind::Kimi]),
+            q: None,
+            limit: 5,
+            ignored_params: Vec::new(),
+        };
+
+        let result = query_threads_by_path(&query, &roots).expect("query should succeed");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].provider, ProviderKind::Kimi);
+        assert_eq!(result.items[0].thread_id, session_id);
+        assert!(
+            result.items[0]
+                .thread_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata
+                    .iter()
+                    .any(|item| item == &format!("cwd = {work_dir_text}")))
         );
     }
 

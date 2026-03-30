@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use crate::error::{Result, XurlError};
@@ -53,6 +55,71 @@ impl KimiProvider {
         let mut hasher = Md5::new();
         hasher.update(path.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    pub fn scope_paths_by_hash(&self) -> HashMap<String, PathBuf> {
+        let Some(meta) = self.load_meta() else {
+            return HashMap::new();
+        };
+
+        meta.work_dirs
+            .into_iter()
+            .map(|work_dir| {
+                (
+                    Self::md5_of_path(&work_dir.path),
+                    PathBuf::from(work_dir.path),
+                )
+            })
+            .collect()
+    }
+
+    pub fn scope_path_from_context_path(path: &Path) -> Option<PathBuf> {
+        let hash = Self::hash_from_context_path(path)?;
+        let root = Self::root_from_context_path(path)?;
+        Self::new(root).scope_paths_by_hash().remove(&hash)
+    }
+
+    pub fn metadata_from_context_path(path: &Path) -> Option<Value> {
+        let hash = Self::hash_from_context_path(path)?;
+        let root = Self::root_from_context_path(path)?;
+        let provider = Self::new(root);
+        let meta = provider.load_meta()?;
+
+        for work_dir in meta.work_dirs {
+            if Self::md5_of_path(&work_dir.path) != hash {
+                continue;
+            }
+
+            let mut value = Map::new();
+            value.insert("cwd".to_string(), Value::String(work_dir.path));
+            if let Some(kaos) = work_dir.kaos {
+                value.insert("kaos".to_string(), Value::String(kaos));
+            }
+            return Some(Value::Object(value));
+        }
+
+        None
+    }
+
+    fn hash_from_context_path(path: &Path) -> Option<String> {
+        if path.file_name()?.to_str()? != "context.jsonl" {
+            return None;
+        }
+
+        path.parent()?
+            .parent()?
+            .file_name()?
+            .to_str()
+            .map(ToString::to_string)
+    }
+
+    fn root_from_context_path(path: &Path) -> Option<PathBuf> {
+        let sessions_root = path.parent()?.parent()?.parent()?;
+        if sessions_root.file_name()?.to_str()? != "sessions" {
+            return None;
+        }
+
+        Some(sessions_root.parent()?.to_path_buf())
     }
 
     fn find_via_metadata(&self, session_id: &str) -> Vec<PathBuf> {
@@ -162,7 +229,9 @@ impl Provider for KimiProvider {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
+    use serde_json::Value;
     use tempfile::tempdir;
 
     use crate::provider::Provider;
@@ -234,5 +303,61 @@ mod tests {
         let hash = KimiProvider::md5_of_path("/Users/alice/some/project");
         assert_eq!(hash.len(), 32);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn extracts_scope_path_from_context_path() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path();
+
+        let work_dir_path = "/Users/alice/some/project";
+        let hash = KimiProvider::md5_of_path(work_dir_path);
+        let session_id = "2823d1df-720a-4c31-ac55-ae8ba726721f";
+
+        let session_dir = root.join("sessions").join(&hash).join(session_id);
+        fs::create_dir_all(&session_dir).expect("mkdir");
+        let context_file = session_dir.join("context.jsonl");
+        fs::write(&context_file, "{\"role\":\"user\",\"content\":\"hello\"}\n")
+            .expect("write context");
+
+        let meta = format!(
+            r#"{{"work_dirs":[{{"path":"{}","kaos":"local","last_session_id":"{}"}}]}}"#,
+            work_dir_path, session_id
+        );
+        fs::write(root.join("kimi.json"), meta).expect("write meta");
+
+        let scope_path = KimiProvider::scope_path_from_context_path(&context_file)
+            .expect("scope path should exist");
+        assert_eq!(scope_path, PathBuf::from(work_dir_path));
+    }
+
+    #[test]
+    fn extracts_metadata_from_context_path() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path();
+
+        let work_dir_path = "/Users/alice/some/project";
+        let hash = KimiProvider::md5_of_path(work_dir_path);
+        let session_id = "2823d1df-720a-4c31-ac55-ae8ba726721f";
+
+        let session_dir = root.join("sessions").join(&hash).join(session_id);
+        fs::create_dir_all(&session_dir).expect("mkdir");
+        let context_file = session_dir.join("context.jsonl");
+        fs::write(&context_file, "{\"role\":\"user\",\"content\":\"hello\"}\n")
+            .expect("write context");
+
+        let meta = format!(
+            r#"{{"work_dirs":[{{"path":"{}","kaos":"local","last_session_id":"{}"}}]}}"#,
+            work_dir_path, session_id
+        );
+        fs::write(root.join("kimi.json"), meta).expect("write meta");
+
+        let metadata =
+            KimiProvider::metadata_from_context_path(&context_file).expect("metadata should exist");
+        assert_eq!(
+            metadata.get("cwd").and_then(Value::as_str),
+            Some(work_dir_path)
+        );
+        assert_eq!(metadata.get("kaos").and_then(Value::as_str), Some("local"));
     }
 }
